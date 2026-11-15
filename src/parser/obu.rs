@@ -651,6 +651,38 @@ mod tests {
         b.into_bytes()
     }
 
+    /// Build a reduced sequence header payload whose `film_grain_params_present`
+    /// is the last bit of a byte, so its trailing bits take a byte of their own.
+    ///
+    /// With the usual encoder flags this is the layout of any stream from 513 to
+    /// 1024 pixels wide and 257 to 512 high, 640x480 among them.
+    fn build_byte_ending_sequence_header_bytes() -> Vec<u8> {
+        let mut b = BitBuilder::default();
+        b.push_bits(0, 3); // seq_profile = 0
+        b.push_bool(true); // still_picture
+        b.push_bool(true); // reduced_still_picture_header
+        b.push_bits(4, 5); // seq_level_idx = 4
+        b.push_bits(3, 4); // frame_width_bits_minus_1 = 3
+        b.push_bits(3, 4); // frame_height_bits_minus_1 = 3
+        b.push_bits(0, 4); // max_frame_width_minus_1 = 0
+        b.push_bits(0, 4); // max_frame_height_minus_1 = 0
+        b.push_bool(false); // use_128x128_superblock
+        b.push_bool(false); // enable_filter_intra
+        b.push_bool(false); // enable_intra_edge_filter
+        b.push_bool(false); // enable_superres
+        b.push_bool(false); // enable_cdef
+        b.push_bool(false); // enable_restoration
+        b.push_bool(false); // high_bitdepth
+        b.push_bool(false); // monochrome
+        b.push_bool(false); // color_description_present_flag
+        b.push_bool(false); // color_range = limited
+        b.push_bits(0, 2); // chroma_sample_position
+        b.push_bool(false); // separate_uv_delta_q
+        b.push_bool(false); // film_grain_params_present: bit 39, the last of byte 4
+        b.push_bits(0x80, 8); // trailing_bits: a one, then zeros to the byte's end
+        b.into_bytes()
+    }
+
     // ===== Group 1: adjust_obu_size =====
 
     #[test]
@@ -1156,6 +1188,31 @@ mod tests {
             .expect("should parse seq header OBU");
 
         assert!(!parser.packet_out.is_empty());
+    }
+
+    #[test]
+    fn parse_obu_sequence_header_write_toggles_grain_flag_that_ends_a_byte() {
+        let seq_payload = build_byte_ending_sequence_header_bytes();
+        assert_eq!(seq_payload.len(), 6);
+        let obu = build_obu_bytes(ObuType::SequenceHeader, None, true, &seq_payload);
+        let next = build_obu_bytes(ObuType::TemporalDelimiter, None, true, &[]);
+        let mut stream = obu.clone();
+        stream.extend_from_slice(&next);
+        let mut parser = make_parser::<true>(0, false, None, Vec::new());
+        parser.incoming_grain_header = Some(Vec::new());
+
+        let (remaining, result) = parser
+            .parse_obu(&stream, 0)
+            .expect("should parse seq header OBU");
+
+        assert!(matches!(result, Some(Obu::SequenceHeader(_))));
+        assert_eq!(remaining, &next[..]);
+        // Only the flag changes: payload byte 4 (after the OBU header and its
+        // one-byte size), lowest bit. The size and the trailing bits stay as
+        // they were, so the next OBU still starts where it did.
+        let mut expected = obu;
+        expected[2 + 4] |= 1;
+        assert_eq!(parser.packet_out, expected);
     }
 
     // ===== Group 8: parse_obu — TileGroup panic + error conditions =====
